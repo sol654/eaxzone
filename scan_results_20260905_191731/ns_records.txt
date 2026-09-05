@@ -1,4 +1,0 @@
-# NS Records Found
-zo.hsg: No NS records found
-google.com: ns4.google.com.,ns1.google.com.,ns2.google.com.,ns3.google.com.
-zonetransfer.me: nsztm2.digi.ninja.,nsztm1.digi.ninja.
