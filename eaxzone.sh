@@ -17,22 +17,11 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 BOLD='\033[1m'
 
-# Configuration
+# Configuration (defaults, may be overridden by CLI args)
 TIMEOUT=10
 MAX_RETRIES=2
-OUTPUT_DIR="scan_results_$(date +%Y%m%d_%H%M%S)"
+OUTPUT_DIR=""
 THREADS=5  # Parallel processing
-
-# Create output directory
-mkdir -p "$OUTPUT_DIR"
-
-# Logging setup
-LOG_FILE="$OUTPUT_DIR/scan.log"
-MASTER_RESULT="$OUTPUT_DIR/master_report.txt"
-NS_RESULT="$OUTPUT_DIR/ns_records.txt"
-AXFR_RESULT="$OUTPUT_DIR/axfr_results.txt"
-JSON_OUTPUT="$OUTPUT_DIR/results.json"
-CSV_OUTPUT="$OUTPUT_DIR/results.csv"
 
 # ============================================================
 # Function: Display Banner
@@ -78,7 +67,7 @@ log() {
     local level=$1
     local message=$2
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    
+
     case $level in
         "INFO") echo -e "${GREEN}[+]${NC} $message" ;;
         "WARN") echo -e "${YELLOW}[!]${NC} $message" ;;
@@ -88,8 +77,11 @@ log() {
         "FAIL") echo -e "${RED}[✗]${NC} $message" ;;
         *) echo "$message" ;;
     esac
-    
-    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+
+    # LOG_FILE is only guaranteed to exist once main() has finalized OUTPUT_DIR
+    if [[ -n "$LOG_FILE" ]]; then
+        echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    fi
 }
 
 # ============================================================
@@ -115,14 +107,16 @@ get_ns_records() {
     local domain=$1
     local ns_list=""
     local retry=0
-    
+
     while [[ $retry -lt $MAX_RETRIES ]]; do
-        ns_list=$(dig ns "$domain" +short +timeout=$TIMEOUT 2>/dev/null | \
+        # NOTE: dig's option is "+time" (per-try timeout), not "+timeout".
+        # We also wrap with the `timeout` binary so a hung query can't stall the whole scan.
+        ns_list=$(timeout "$TIMEOUT" dig ns "$domain" +short +time="$TIMEOUT" +tries=1 2>/dev/null | \
                   grep -v '^$' | \
                   head -10 | \
                   tr '\n' ',' | \
                   sed 's/,$//')
-        
+
         if [[ -n "$ns_list" ]]; then
             echo "$ns_list"
             return 0
@@ -130,7 +124,7 @@ get_ns_records() {
         ((retry++))
         sleep 1
     done
-    
+
     echo "NO_NS_RECORDS"
     return 1
 }
@@ -142,35 +136,42 @@ test_axfr() {
     local domain=$1
     local ns=$2
     local result=""
-    
+
     # Clean the nameserver (remove trailing dot if present)
     ns=$(echo "$ns" | sed 's/\.$//')
-    
+
     log "DEBUG" "Testing AXFR for $domain on NS: $ns"
-    
-    # Perform AXFR request with timeout
-    result=$(dig axfr "$domain" @"$ns" +noall +answer +timeout=$TIMEOUT 2>/dev/null)
+
+    # Perform AXFR request. AXFR is done over TCP, and dig's own +time option
+    # is unreliable for TCP transfers, so wrap the call in `timeout` to enforce
+    # a hard wall-clock limit and prevent the whole scan from hanging.
+    result=$(timeout "$TIMEOUT" dig axfr "$domain" @"$ns" +time="$TIMEOUT" +tries=1 2>&1)
     local exit_code=$?
-    
-    if [[ $exit_code -ne 0 ]]; then
+
+    # `timeout` returns 124 if the command was killed for taking too long
+    if [[ $exit_code -eq 124 ]]; then
         echo "ERROR: Timeout or connection failed"
         return 1
     fi
-    
+
     if [[ -z "$result" ]]; then
         echo "NO_RECORDS"
         return 2
     fi
-    
-    # Check for common error messages
-    if echo "$result" | grep -qi "Transfer failed\|connection timed out\|no servers\|refused\|not authoritative"; then
+
+    # Check for common error messages (server refused/failed the transfer)
+    if echo "$result" | grep -qi "transfer failed\|connection timed out\|no servers\|refused\|not authoritative\|communications error\|connection reset\|network unreachable\|failed"; then
         echo "REFUSED"
         return 3
     fi
-    
-    # Check if we got actual records
-    if echo "$result" | grep -q "; <<>> DiG"; then
-        # It's a successful response
+
+    # A successful zone transfer always begins (and ends) with an SOA record
+    # for the zone. We deliberately do NOT look for the "; <<>> DiG" comment
+    # line here, because "+noall +answer" (previously used) strips that
+    # comment out entirely, which meant a real successful transfer could
+    # never be recognized as SUCCESS. Checking for an SOA record for the
+    # requested domain is a reliable, format-independent signal instead.
+    if echo "$result" | grep -qi "^${domain}\.[[:space:]].*[[:space:]]SOA[[:space:]]"; then
         echo "$result"
         return 0
     else
@@ -186,37 +187,37 @@ process_domain() {
     local domain=$1
     local domain_file=$2
     local temp_dir=$3
-    
+
     # Create temp file for this domain's results
     local temp_file="$temp_dir/${domain//[^a-zA-Z0-9]/_}.tmp"
-    
+
     echo "Processing: $domain" | tee -a "$temp_file"
-    
+
     # Step 1: Get NS records
     ns_records=$(get_ns_records "$domain")
-    
+
     if [[ "$ns_records" == "NO_NS_RECORDS" || -z "$ns_records" ]]; then
         echo "FAIL|$domain|NO_NS|No nameservers found" >> "$temp_file"
         echo "$domain: No NS records found" >> "$NS_RESULT"
         return 1
     fi
-    
+
     # Save NS records
     echo "$domain: $ns_records" >> "$NS_RESULT"
-    
+
     # Step 2: Test AXFR on each nameserver
     local axfr_success=false
     IFS=',' read -ra ns_array <<< "$ns_records"
-    
+
     for ns in "${ns_array[@]}"; do
         ns=$(echo "$ns" | xargs)  # Trim whitespace
         [[ -z "$ns" ]] && continue
-        
+
         echo "[*] Testing $domain on NS: $ns" | tee -a "$temp_file"
-        
+
         axfr_result=$(test_axfr "$domain" "$ns")
         local result_code=$?
-        
+
         case $result_code in
             0)
                 # Successful AXFR
@@ -224,7 +225,7 @@ process_domain() {
                 echo "    *** SUCCESS! Zone transfer successful on $ns ***" >> "$temp_file"
                 echo "$axfr_result" | tee -a "$temp_file"
                 axfr_success=true
-                
+
                 # Log to master result
                 {
                     echo ""
@@ -251,7 +252,7 @@ process_domain() {
         esac
         echo "" >> "$temp_file"
     done
-    
+
     # Summary for this domain
     if [[ "$axfr_success" == true ]]; then
         echo "STATUS|$domain|VULNERABLE" >> "$temp_file"
@@ -260,7 +261,7 @@ process_domain() {
         echo "STATUS|$domain|SECURE" >> "$temp_file"
         echo -e "${GREEN}[✓] SECURE: $domain - No zone transfer vulnerabilities found${NC}" | tee -a "$temp_file"
     fi
-    
+
     echo "----------------------------------------" >> "$temp_file"
 }
 
@@ -269,7 +270,7 @@ process_domain() {
 # ============================================================
 generate_json() {
     log "INFO" "Generating JSON report..."
-    
+
     echo '{' > "$JSON_OUTPUT"
     echo '  "scan_info": {' >> "$JSON_OUTPUT"
     echo '    "timestamp": "'$(date -Iseconds)'",' >> "$JSON_OUTPUT"
@@ -277,9 +278,12 @@ generate_json() {
     echo '    "version": "2.0"' >> "$JSON_OUTPUT"
     echo '  },' >> "$JSON_OUTPUT"
     echo '  "results": [' >> "$JSON_OUTPUT"
-    
+
     local first=true
-    while IFS='|' read -r status domain ns records; do
+    # NOTE: -h is required here. With more than one file argument, grep
+    # prefixes every match with "filename:", which broke the "SUCCESS"
+    # field comparison below and silently produced an always-empty report.
+    while IFS='|' read -r status domain ns; do
         if [[ "$status" == "SUCCESS" ]]; then
             if [[ "$first" == true ]]; then
                 first=false
@@ -293,12 +297,12 @@ generate_json() {
             echo '      "zone_transfer": "SUCCESS"' >> "$JSON_OUTPUT"
             echo -n '    }' >> "$JSON_OUTPUT"
         fi
-    done < <(grep "^SUCCESS|" "$temp_dir"/*.tmp 2>/dev/null)
-    
+    done < <(grep -h "^SUCCESS|" "$temp_dir"/*.tmp 2>/dev/null)
+
     echo '' >> "$JSON_OUTPUT"
     echo '  ]' >> "$JSON_OUTPUT"
     echo '}' >> "$JSON_OUTPUT"
-    
+
     log "SUCCESS" "JSON report generated: $JSON_OUTPUT"
 }
 
@@ -307,22 +311,27 @@ generate_json() {
 # ============================================================
 generate_csv() {
     log "INFO" "Generating CSV report..."
-    
+
     echo "Domain,Nameserver,Vulnerable,ZoneTransfer" > "$CSV_OUTPUT"
-    
-    while IFS='|' read -r status domain ns records; do
+
+    # NOTE: -h suppresses the "filename:" prefix grep adds when given
+    # multiple file arguments (the *.tmp glob) - without it, $status never
+    # equals "SUCCESS"/"STATUS" and these loops silently produce nothing.
+    while IFS='|' read -r status domain ns; do
         if [[ "$status" == "SUCCESS" ]]; then
             echo "$domain,$ns,Yes,Successful" >> "$CSV_OUTPUT"
         fi
-    done < <(grep "^SUCCESS|" "$temp_dir"/*.tmp 2>/dev/null)
-    
-    # Add secure domains
-    while IFS='|' read -r status domain; do
-        if [[ "$status" == "STATUS" && "$domain" != "VULNERABLE" ]]; then
+    done < <(grep -h "^SUCCESS|" "$temp_dir"/*.tmp 2>/dev/null)
+
+    # Add secure domains. STATUS lines look like "STATUS|domain|VULNERABLE"
+    # or "STATUS|domain|SECURE" - we need a 3rd read variable to capture the
+    # verdict field, otherwise it gets glued onto $domain by `read`.
+    while IFS='|' read -r status domain verdict; do
+        if [[ "$status" == "STATUS" && "$verdict" == "SECURE" ]]; then
             echo "$domain,N/A,No,Not Tested" >> "$CSV_OUTPUT"
         fi
-    done < <(grep "^STATUS|" "$temp_dir"/*.tmp 2>/dev/null | grep -v "VULNERABLE")
-    
+    done < <(grep -h "^STATUS|" "$temp_dir"/*.tmp 2>/dev/null)
+
     log "SUCCESS" "CSV report generated: $CSV_OUTPUT"
 }
 
@@ -336,7 +345,8 @@ main() {
     VERBOSE=false
     GENERATE_JSON=false
     GENERATE_CSV=false
-    
+    USER_SPECIFIED_OUTPUT=false
+
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -346,6 +356,7 @@ main() {
                 ;;
             -o|--output)
                 OUTPUT_DIR="$2"
+                USER_SPECIFIED_OUTPUT=true
                 shift 2
                 ;;
             -t|--timeout)
@@ -384,33 +395,52 @@ main() {
                 ;;
         esac
     done
-    
+
     # Validate input
     if [[ -z "$INPUT_FILE" ]]; then
         log "ERROR" "No input file specified"
         show_help
         exit 1
     fi
-    
+
     if [[ ! -f "$INPUT_FILE" ]]; then
         log "ERROR" "Input file not found: $INPUT_FILE"
         exit 1
     fi
-    
-    # Recreate output directory
+
+    # Only fall back to an auto-generated timestamped directory when the
+    # user did NOT pass -o/--output. If they did pass -o, that exact
+    # directory is used and nothing else.
+    if [[ "$USER_SPECIFIED_OUTPUT" == false ]]; then
+        OUTPUT_DIR="scan_results_$(date +%Y%m%d_%H%M%S)"
+    fi
+
+    # Now that OUTPUT_DIR is finalized, derive all output file paths from it.
+    # (Previously these were computed once at the top of the script, before
+    # argument parsing, so passing -o had no effect on where results were
+    # actually written - everything still went to the default timestamped
+    # directory. Computing them here fixes that.)
+    LOG_FILE="$OUTPUT_DIR/scan.log"
+    MASTER_RESULT="$OUTPUT_DIR/master_report.txt"
+    NS_RESULT="$OUTPUT_DIR/ns_records.txt"
+    AXFR_RESULT="$OUTPUT_DIR/axfr_results.txt"
+    JSON_OUTPUT="$OUTPUT_DIR/results.json"
+    CSV_OUTPUT="$OUTPUT_DIR/results.csv"
+
+    # Create output directory
     mkdir -p "$OUTPUT_DIR"
     temp_dir="$OUTPUT_DIR/temp"
     mkdir -p "$temp_dir"
-    
+
     # Initialize result files
     echo "# Domain Security Scanner Results" > "$MASTER_RESULT"
     echo "# Scan started: $(date)" >> "$MASTER_RESULT"
     echo "=========================================" >> "$MASTER_RESULT"
     echo "" >> "$MASTER_RESULT"
-    
+
     echo "# NS Records Found" > "$NS_RESULT"
     echo "# AXFR Test Results" > "$AXFR_RESULT"
-    
+
     # Display banner if not quiet
     if [[ "$QUIET" == false ]]; then
         banner
@@ -422,53 +452,53 @@ main() {
         echo "  Parallel threads: $THREADS"
         echo ""
     fi
-    
+
     # Count total domains
     total_domains=$(grep -v '^$' "$INPUT_FILE" | wc -l)
     log "INFO" "Processing $total_domains domains..."
-    
+
     # Process domains
     processed=0
     vulnerabilities=0
-    
+
     # Use temporary files for processing
     while IFS= read -r domain; do
         # Skip empty lines
         [[ -z "$domain" ]] && continue
-        
+
         # Clean domain
         domain=$(echo "$domain" | xargs)
-        
+
         # Validate domain
         if ! validate_domain "$domain"; then
             log "WARN" "Invalid domain format: $domain - Skipping"
             continue
         fi
-        
+
         ((processed++))
         echo -ne "\r${CYAN}Progress: $processed/$total_domains${NC}" >&2
-        
+
         # Process domain
         process_domain "$domain" "$INPUT_FILE" "$temp_dir" >> "$MASTER_RESULT"
-        
+
         # Check if vulnerable
         if grep -q "^SUCCESS|" "$temp_dir/${domain//[^a-zA-Z0-9]/_}.tmp" 2>/dev/null; then
             ((vulnerabilities++))
         fi
-        
+
     done < <(grep -v '^$' "$INPUT_FILE")
-    
+
     echo -e "\n" >&2
-    
+
     # Generate reports
     if [[ "$GENERATE_JSON" == true ]]; then
         generate_json
     fi
-    
+
     if [[ "$GENERATE_CSV" == true ]]; then
         generate_csv
     fi
-    
+
     # Final summary
     log "SUCCESS" "Scan completed!"
     echo ""
@@ -476,7 +506,7 @@ main() {
     echo -e "${BOLD}${GREEN}SCAN COMPLETE - SUMMARY${NC}"
     echo -e "${BLUE}───────────────────────────────────────────────────────────${NC}"
     echo "  Total domains tested: $total_domains"
-    echo "  Vulnerable domains: ${RED}$vulnerabilities${NC}"
+    echo -e "  Vulnerable domains: ${RED}$vulnerabilities${NC}"
     echo "  Secure domains: $((total_domains - vulnerabilities))"
     echo ""
     echo -e "${BOLD}Results saved in: ${CYAN}$OUTPUT_DIR/${NC}"
@@ -490,7 +520,7 @@ main() {
         echo "  - CSV report: $CSV_OUTPUT"
     fi
     echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
-    
+
     # Cleanup temp files
     rm -rf "$temp_dir"
 }

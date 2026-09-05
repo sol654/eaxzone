@@ -1,0 +1,8 @@
+[2026-09-05 19:13:57] [INFO] Processing 3 domains...
+[2026-09-05 19:13:59] [DEBUG] Testing AXFR for google.com on NS: ns2.google.com
+[2026-09-05 19:13:59] [DEBUG] Testing AXFR for google.com on NS: ns3.google.com
+[2026-09-05 19:14:00] [DEBUG] Testing AXFR for google.com on NS: ns1.google.com
+[2026-09-05 19:14:00] [DEBUG] Testing AXFR for google.com on NS: ns4.google.com
+[2026-09-05 19:14:01] [DEBUG] Testing AXFR for zonetransfer.me on NS: nsztm1.digi.ninja
+[2026-09-05 19:14:02] [DEBUG] Testing AXFR for zonetransfer.me on NS: nsztm2.digi.ninja
+[2026-09-05 19:14:02] [SUCCESS] Scan completed!
